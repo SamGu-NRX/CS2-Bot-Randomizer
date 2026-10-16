@@ -112,10 +112,21 @@ public sealed class BotRandomizerPlugin : BasePlugin
 
         _applicator = new CosmeticApplicator(writer, Logger);
         MemoryFunctionWithReturn<nint, nint>? itemViewConstructor = null;
+        MemoryFunctionWithReturn<nint, uint, nint>? itemViewDestructor = null;
         if (writer is not null)
         {
             try
             {
+                if (OperatingSystem.IsWindows())
+                {
+                    // MSVC scalar deleting destructor: flags=0 destroys members without
+                    // deleting the outer AllocHGlobal allocation. Linux ABI is not audited.
+                    if (!Environment.Is64BitProcess)
+                        throw new PlatformNotSupportedException("CEconItemView destruction requires Windows x64");
+                    itemViewDestructor = new MemoryFunctionWithReturn<nint, uint, nint>(
+                        "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20 48 8D 05 ? ? ? ? 8B EA 48 89 01 48 8B D9 83 79 78 00");
+                }
+
                 // CEconItemViewConstructor
                 itemViewConstructor = new MemoryFunctionWithReturn<nint, nint>(
                     RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
@@ -124,12 +135,14 @@ public sealed class BotRandomizerPlugin : BasePlugin
             }
             catch (Exception exception)
             {
+                itemViewConstructor = null;
+                itemViewDestructor = null;
                 Logger.LogError(
                     exception,
-                    "[BotRandomizer] CEconItemView constructor signature failed; weapon cosmetics disabled");
+                    "[BotRandomizer] CEconItemView lifetime signatures failed; weapon cosmetics disabled");
             }
         }
-        _weaponItemViews = new WeaponItemViewStore(itemViewConstructor, writer, Logger);
+        _weaponItemViews = new WeaponItemViewStore(itemViewConstructor, itemViewDestructor, writer, Logger);
     }
 
     private void OnMapStart(string mapName)
