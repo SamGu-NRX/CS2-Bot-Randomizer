@@ -11,7 +11,7 @@ internal sealed class WeaponItemViewStore : IDisposable
     private const ulong SteamId64AccountBase = 76_561_197_960_265_728;
 
     private readonly MemoryFunctionWithReturn<nint, nint>? _constructor;
-    private readonly MemoryFunctionWithReturn<nint, uint, nint>? _destructor;
+    private readonly Action<nint>? _destructor;
     private readonly MemoryFunctionWithReturn<nint, string, float, int>? _setAttributeByName;
     private readonly ILogger _logger;
     private readonly Dictionary<(int Slot, int UserId, ushort DefIndex), nint> _views = [];
@@ -20,7 +20,7 @@ internal sealed class WeaponItemViewStore : IDisposable
 
     internal WeaponItemViewStore(
         MemoryFunctionWithReturn<nint, nint>? constructor,
-        MemoryFunctionWithReturn<nint, uint, nint>? destructor,
+        Action<nint>? destructor,
         MemoryFunctionWithReturn<nint, string, float, int>? setAttributeByName,
         ILogger logger)
     {
@@ -31,7 +31,7 @@ internal sealed class WeaponItemViewStore : IDisposable
     }
 
     internal bool NativeAvailable => _constructor is not null && _setAttributeByName is not null
-        && (!OperatingSystem.IsWindows() || _destructor is not null);
+        && _destructor is not null;
 
     internal bool TryPrepare(
         SlotCosmeticState state,
@@ -141,9 +141,9 @@ internal sealed class WeaponItemViewStore : IDisposable
     private void Destroy(nint handle)
     {
         // GiveNamedItem copies the view; release the source only at slot teardown
-        // or after unhooking on unload. Linux retains its existing cleanup until
-        // its non-deleting destructor ABI has been verified.
-        _destructor?.Invoke(handle, 0);
+        // or after unhooking on unload. Both platform bindings destroy members
+        // without freeing the outer AllocHGlobal allocation.
+        _destructor!(handle);
         Marshal.FreeHGlobal(handle);
     }
 
