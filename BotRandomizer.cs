@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using CounterStrikeSharp.API;
+using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
 using CounterStrikeSharp.API.Modules.Admin;
@@ -14,7 +15,17 @@ namespace BotRandomizer;
 
 public sealed class BotRandomizerPlugin : BasePlugin
 {
+    // Opt-in: knives spawned without an owner (e.g. by subclass_create) get a random finish.
+    public readonly FakeConVar<bool> DroppedKnifeSkins = new("br_dropped_knife_skins",
+        "Give knives spawned without an owner a random finish (0 = off, 1 = on)", false);
+
+    // Opt-in: favor expensive finishes on dropped knives. Bot loadouts are unaffected.
+    public readonly FakeConVar<bool> DroppedKnifePremium = new("br_dropped_knife_premium",
+        "Strongly favor expensive finishes on dropped knives (0 = off, 1 = on)", false);
+
     private readonly CosmeticStateStore _states = new();
+    // Raw handles of dropped knives this plugin painted; claimed by the human who picks one up.
+    private readonly HashSet<uint> _paintedDroppedKnives = [];
     private readonly HashSet<int> _pendingRerolls = [];
 
     private CosmeticCatalog? _catalog;
@@ -37,6 +48,8 @@ public sealed class BotRandomizerPlugin : BasePlugin
 
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
         RegisterListener<Listeners.OnClientDisconnect>(OnClientDisconnect);
+        RegisterListener<Listeners.OnEntitySpawned>(OnEntitySpawned);
+        RegisterListener<Listeners.OnEntityDeleted>(OnEntityDeleted);
         RegisterEventHandler<EventRoundPrestart>(OnRoundPrestart, HookMode.Pre);
         RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn);
         RegisterEventHandler<EventRoundMvp>(OnRoundMvp, HookMode.Pre);
@@ -132,9 +145,47 @@ public sealed class BotRandomizerPlugin : BasePlugin
         _weaponItemViews = new WeaponItemViewStore(itemViewConstructor, writer, Logger);
     }
 
+    private void OnEntitySpawned(CEntityInstance entity)
+    {
+        // Every spawn passes through here; check the cheap conditions and the designer
+        // name before reading any schema field.
+        if (!DroppedKnifeSkins.Value
+            || _roller is null
+            || _applicator?.NativeAvailable != true
+            || !entity.DesignerName.StartsWith("weapon_knife", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        // subclass_create knives keep the default knife's definition (42 CT, 59 T) and differ
+        // only by subclass. Inventory and bot knives carry their real definition, so they never match.
+        var weapon = new CBasePlayerWeapon(entity.Handle);
+        var item = weapon.AttributeManager?.Item;
+        if (item is null
+            || item.ItemDefinitionIndex is not (42 or 59)
+            || !KnifeSubclass.TryGetDefIndex(weapon.SubclassID.Value, out var defIndex))
+        {
+            return;
+        }
+
+        // Apply during the spawn, before the knife is first sent to clients: a finish set on a
+        // knife clients already received shows in its name but is never drawn.
+        if (_applicator.ApplyDroppedKnifeFinish(weapon, _roller, defIndex, DroppedKnifePremium.Value))
+            _paintedDroppedKnives.Add(weapon.EntityHandle.Raw);
+    }
+
+    private void OnEntityDeleted(CEntityInstance entity)
+    {
+        if (_paintedDroppedKnives.Count == 0)
+            return;
+
+        _paintedDroppedKnives.Remove(entity.EntityHandle.Raw);
+    }
+
     private void OnMapStart(string mapName)
     {
         _states.Reset();
+        _paintedDroppedKnives.Clear();
         _pendingRerolls.Clear();
         _roller?.ResetMap();
         // Keep constructed item-view storage alive across map transitions. Each view is
@@ -333,6 +384,14 @@ public sealed class BotRandomizerPlugin : BasePlugin
             return HookResult.Continue;
         }
 
+        if (@event.Userid is { IsValid: true, IsBot: false } human && _paintedDroppedKnives.Count > 0)
+        {
+            var steamId = human.SteamID;
+            var pawnHandle = human.PlayerPawn.Raw;
+            Server.NextFrame(() => ClaimPaintedKnives(pawnHandle, steamId));
+            return HookResult.Continue;
+        }
+
         var state = GetOrCreateState(@event.Userid);
         if (state is null)
             return HookResult.Continue;
@@ -341,6 +400,22 @@ public sealed class BotRandomizerPlugin : BasePlugin
         ScheduleKnifeSync(state.Slot, state.UserId, state.Generation, delay: 0.10f);
         ScheduleKnifeSync(state.Slot, state.UserId, state.Generation, delay: 0.25f);
         return HookResult.Continue;
+    }
+
+    private void ClaimPaintedKnives(uint pawnHandle, ulong steamId)
+    {
+        if (_applicator is null)
+            return;
+        var pawn = new CHandle<CCSPlayerPawn>(pawnHandle).Value;
+        var weapons = pawn is { IsValid: true } ? pawn.WeaponServices?.MyWeapons : null;
+        if (weapons is null)
+            return;
+        foreach (var handle in weapons)
+        {
+            var weapon = handle.Value;
+            if (weapon is { IsValid: true } && _paintedDroppedKnives.Remove(weapon.EntityHandle.Raw))
+                _applicator.ClaimDroppedKnife(weapon, steamId);
+        }
     }
 
     private HookResult OnPlayerTeam(EventPlayerTeam @event, GameEventInfo info)

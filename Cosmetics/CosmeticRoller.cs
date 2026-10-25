@@ -32,6 +32,39 @@ internal sealed class CosmeticRoller
         _catalog = catalog;
         _charmPlacements = charmPlacements;
         _random = random ?? new Random();
+        // Spawn-time rolls reuse these pools instead of allocating LINQ groups.
+        foreach (var paints in catalog.KnifePaintPools)
+        {
+            _knifeFinishPools.Add(paints, paints
+                .GroupBy(paint => paint.Finish, StringComparer.Ordinal)
+                .Select(group => (IReadOnlyList<KnifePaintCatalogEntry>)group.ToArray())
+                .ToArray());
+        }
+    }
+
+    // Premium squares finish weights, so a Doppler (10) becomes 100x as likely as an
+    // unlisted finish (1) instead of 10x, while cheap finishes stay possible.
+    private static int KnifeWeight(int weight, bool premium) => premium ? weight * weight : weight;
+
+    // No-finish ("vanilla") weight for dropped knives. No data behind it: chosen to make
+    // vanilla about as likely as one mid-tier finish such as Case Hardened (weight 4).
+    private const int VanillaKnifeWeight = 4;
+
+    // paintKit 0 means vanilla: the knife keeps its default look.
+    internal bool TryRollKnifeFinish(ushort defIndex, bool allowVanilla, bool premium, out int paintKit, out float wear)
+    {
+        paintKit = 0;
+        wear = 0;
+        if (!_catalog.TryGetKnifePaints(defIndex, out var paints))
+            return false;
+
+        if (allowVanilla && RollsVanilla(paints, premium))
+            return true;
+
+        var paint = PickKnifePaint(paints, premium);
+        paintKit = paint.PaintKit;
+        wear = DefaultWear(paint.WearMin, paint.WearMax);
+        return true;
     }
 
     internal BotCosmeticLoadout RollLoadout(byte team, int? preservedMusicKit = null)
@@ -91,7 +124,7 @@ internal sealed class CosmeticRoller
             throw new InvalidOperationException(
                 $"No paint catalog for knife {knifeDefinition.DefIndex}.");
         }
-        var knifePaint = PickKnifePaint(knifePaints);
+        var knifePaint = PickKnifePaint(knifePaints, premium: false);
         var glove = PickWeighted(
             _catalog.Gloves,
             gloveVariant => RandomizerAssets.GetGloveVariantWeight(gloveVariant.DefIndex));
@@ -254,21 +287,34 @@ internal sealed class CosmeticRoller
         return Pick(rarityPool);
     }
 
-    private KnifePaintCatalogEntry PickKnifePaint(
-        IReadOnlyList<KnifePaintCatalogEntry> paints)
+    private int TotalFinishWeight(IReadOnlyList<KnifePaintCatalogEntry> paints, bool premium)
     {
-        if (!_knifeFinishPools.TryGetValue(paints, out var finishPools))
+        var finishPools = _knifeFinishPools[paints];
+        var totalWeight = 0;
+        for (var i = 0; i < finishPools.Length; i++)
+            totalWeight = checked(totalWeight + KnifeWeight(_catalog.GetKnifeFinishWeight(finishPools[i][0].Finish), premium));
+        return totalWeight;
+    }
+
+    private bool RollsVanilla(IReadOnlyList<KnifePaintCatalogEntry> paints, bool premium)
+    {
+        var vanilla = KnifeWeight(VanillaKnifeWeight, premium);
+        return _random.Next(TotalFinishWeight(paints, premium) + vanilla) < vanilla;
+    }
+
+    private KnifePaintCatalogEntry PickKnifePaint(
+        IReadOnlyList<KnifePaintCatalogEntry> paints, bool premium)
+    {
+        var finishPools = _knifeFinishPools[paints];
+        var roll = _random.Next(TotalFinishWeight(paints, premium));
+        for (var i = 0; i < finishPools.Length; i++)
         {
-            finishPools = paints
-                .GroupBy(paint => paint.Finish, StringComparer.Ordinal)
-                .Select(group => (IReadOnlyList<KnifePaintCatalogEntry>)group.ToArray())
-                .ToArray();
-            _knifeFinishPools.Add(paints, finishPools);
+            var weight = KnifeWeight(_catalog.GetKnifeFinishWeight(finishPools[i][0].Finish), premium);
+            if (roll < weight)
+                return Pick(finishPools[i]);
+            roll -= weight;
         }
-        var finishPool = PickWeighted(
-            finishPools,
-            pool => _catalog.GetKnifeFinishWeight(pool[0].Finish));
-        return Pick(finishPool);
+        throw new InvalidOperationException("Weighted knife selection did not resolve.");
     }
 
     private T Pick<T>(IReadOnlyList<T> values)
