@@ -37,6 +37,7 @@ internal sealed class CosmeticCatalog
             .ToArray();
         KeychainDefinitions = document.KeychainDefinitions;
         MusicKits = document.MusicKits;
+        MusicKitNames = document.MusicKitNames ?? new Dictionary<int, string>();
     }
 
     internal IReadOnlyList<GloveCatalogEntry> Gloves { get; }
@@ -46,6 +47,7 @@ internal sealed class CosmeticCatalog
         => _stickerCategoryPools;
     internal IReadOnlyList<uint> KeychainDefinitions { get; }
     internal IReadOnlyList<int> MusicKits { get; }
+    internal IReadOnlyDictionary<int, string> MusicKitNames { get; }
     internal IReadOnlyCollection<WeaponCatalogEntry> Weapons => _weapons.Values;
     internal int WeaponCount => _weapons.Count;
     internal int WeaponPaintCount => _weapons.Values.Sum(entry => entry.Paints.Count);
@@ -238,6 +240,9 @@ internal sealed class CosmeticCatalog
 
         [JsonPropertyName("musicKits")]
         public List<int> MusicKits { get; init; } = [];
+
+        [JsonPropertyName("musicKitNames")]
+        public Dictionary<int, string>? MusicKitNames { get; init; }
     }
 
     private sealed class KnifeCatalogDocument

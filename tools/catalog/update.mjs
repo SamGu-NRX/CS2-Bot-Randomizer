@@ -139,13 +139,20 @@ const stickerKits = stickers.map(item => {
   const finish = /\((Glitter|Holo|Foil|Gold|Lenticular)(?:,|\))/.exec(translation.name)?.[1].toLowerCase() ?? "paper";
   return { defIndex: paintKit(item), finish, category: stickerCategories.indexOf(translation.categoryName) };
 }).sort((a, b) => a.defIndex - b.defIndex);
+const musicKits = unique(variants("musickit").map(paintKit)).filter(id => id !== 1 && id !== 2);
+const musicKitNames = Object.fromEntries(musicKits.map(id => {
+  const item = variants("musickit").find(item => item.variantIndex === id);
+  const name = english[item.id]?.name;
+  if (!name) throw new Error(`Missing music kit name on item ${item.id}`);
+  return [id, name];
+}));
 const catalog = {
   source: { repository: "ianlucas/cs2-lib", commit: source.commit,
     package: source.package, version: source.version, integrity },
   weapons, knives, knifeFinishPreferences: previous.knifeFinishPreferences, gloves,
   stickerCategories, stickerKits,
   keychainDefinitions: unique(variants("keychain").map(paintKit)),
-  musicKits: unique(variants("musickit").map(paintKit)).filter(id => id !== 1 && id !== 2),
+  musicKits, musicKitNames,
 };
 
 // Write runtime files only after both signatures and the complete catalog are ready.
