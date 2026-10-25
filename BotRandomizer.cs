@@ -1,10 +1,10 @@
 using System.Runtime.InteropServices;
 using CounterStrikeSharp.API;
-using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
 using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
+using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Memory.DynamicFunctions;
 using CounterStrikeSharp.API.Modules.Timers;
@@ -27,6 +27,15 @@ public sealed class BotRandomizerPlugin : BasePlugin
     // Raw handles of dropped knives this plugin painted; claimed by the human who picks one up.
     private readonly HashSet<uint> _paintedDroppedKnives = [];
     private readonly HashSet<int> _pendingRerolls = [];
+    private readonly HashSet<int> _warnedPlayerMusicModes = [];
+    private PlayerMusicKitSelection? _playerMusic;
+    private readonly Dictionary<int, PlayerMusicSnapshot> _originalPlayerMusic = [];
+
+    private readonly record struct PlayerMusicSnapshot(
+        uint ControllerHandle, ushort InventoryMusicId, int MusicKitId, int MusicKitMvps, bool MvpNoMusic);
+
+    public FakeConVar<int> PlayerMusicKit = new(
+        "br_player_music_kit", "Human music kit: 0 = off, -1 = random per map, positive = kit ID", 0);
 
     private CosmeticCatalog? _catalog;
     private CosmeticRoller? _roller;
@@ -47,6 +56,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
     {
         LoadCatalog();
         LoadAttributeWriter();
+        PlayerMusicKit.ValueChanged += OnPlayerMusicKitChanged;
 
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
         RegisterListener<Listeners.OnClientDisconnect>(OnClientDisconnect);
@@ -63,6 +73,11 @@ public sealed class BotRandomizerPlugin : BasePlugin
             HostConsole.HandleConVar(player, command, DroppedKnifeSkins, _dedicatedServer));
         AddCommandListener(DroppedKnifePremium.Name, (player, command) =>
             HostConsole.HandleConVar(player, command, DroppedKnifePremium, _dedicatedServer));
+        AddCommandListener(PlayerMusicKit.Name, (player, command) =>
+            HostConsole.HandleConVar(player, command, PlayerMusicKit, _dedicatedServer,
+                mode => _playerMusic?.IsKnownMode(mode) == false
+                    ? $"unknown kit ID {mode}; br_player_music_kits lists them."
+                    : null));
         if (_weaponItemViews?.NativeAvailable == true)
         {
             VirtualFunctions.GiveNamedItemFunc.Hook(OnGiveNamedItemPre, HookMode.Pre);
@@ -75,6 +90,8 @@ public sealed class BotRandomizerPlugin : BasePlugin
 
     public override void Unload(bool hotReload)
     {
+        PlayerMusicKit.ValueChanged -= OnPlayerMusicKitChanged;
+        RestorePlayerMusicKits();
         if (_giveNamedItemHooked)
         {
             VirtualFunctions.GiveNamedItemFunc.Unhook(OnGiveNamedItemPre, HookMode.Pre);
@@ -94,6 +111,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
             _catalog = CosmeticCatalog.Load(catalogPath);
             var charmPlacements = CharmPlacementCatalog.Load(placementPath, _catalog);
             _roller = new CosmeticRoller(_catalog, charmPlacements);
+            _playerMusic = new PlayerMusicKitSelection(_catalog.MusicKits);
             Logger.LogInformation(
                 "[BotRandomizer] Catalog loaded: {Weapons} weapons, {Paints} weapon paints, {Stickers} stickers, {Charms} charms; {CharmPositions} charm positions for {CharmWeapons} weapons",
                 _catalog.WeaponCount,
@@ -107,6 +125,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
         {
             _catalog = null;
             _roller = null;
+            _playerMusic = null;
             Logger.LogError(
                 exception,
                 "[BotRandomizer] cosmetic_catalog.json or charm_placements.json is invalid; randomization disabled");
@@ -225,10 +244,14 @@ public sealed class BotRandomizerPlugin : BasePlugin
 
     private void OnMapStart(string mapName)
     {
+        RestorePlayerMusicKits();
         _states.Reset();
         _paintedDroppedKnives.Clear();
         _pendingRerolls.Clear();
         _roller?.ResetMap();
+        _playerMusic?.ResetMap();
+        // Resolve now so random mode has one shared selection for the whole map.
+        ResolvePlayerMusicKit();
         // Keep constructed item-view storage alive across map transitions. Each view is
         // fully overwritten before reuse and is freed only at slot teardown or unload.
         _applicator?.Reset();
@@ -241,6 +264,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
     private void OnClientDisconnect(int playerSlot)
     {
         _states.Remove(playerSlot);
+        _originalPlayerMusic.Remove(playerSlot);
         _pendingRerolls.Remove(playerSlot);
         _weaponItemViews?.ClearSlot(playerSlot);
         _applicator?.ClearSlot(playerSlot);
@@ -253,6 +277,8 @@ public sealed class BotRandomizerPlugin : BasePlugin
         // Deferred one frame so this round's intro entities already exist. Rerolls are consumed
         // first, so the intro publishes the loadout the bot will actually spawn with.
         Server.NextFrame(ApplyIntroAgents);
+        if (PlayerMusicKit.Value != 0)
+            Server.NextFrame(ApplyAllPlayerMusicKits);
         return HookResult.Continue;
     }
 
@@ -340,6 +366,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
 
     private HookResult OnPlayerSpawn(EventPlayerSpawn @event, GameEventInfo info)
     {
+        ApplyPlayerMusicKit(@event.Userid);
         ConsumePendingReroll(@event.Userid);
         var state = GetOrCreateState(@event.Userid);
         if (state is null)
@@ -462,6 +489,8 @@ public sealed class BotRandomizerPlugin : BasePlugin
     private HookResult OnPlayerTeam(EventPlayerTeam @event, GameEventInfo info)
     {
         var player = @event.Userid;
+        if (!@event.Disconnect)
+            ApplyPlayerMusicKit(player);
         if (player is not { IsValid: true, IsBot: true } || player.UserId is not int userId)
             return HookResult.Continue;
 
@@ -495,6 +524,15 @@ public sealed class BotRandomizerPlugin : BasePlugin
 
     private HookResult OnRoundMvp(EventRoundMvp @event, GameEventInfo info)
     {
+        var playerKitId = ApplyPlayerMusicKit(@event.Userid);
+        if (playerKitId != 0)
+        {
+            @event.Musickitid = playerKitId;
+            @event.Musickitmvps = 0;
+            @event.Nomusic = 0;
+            return HookResult.Continue;
+        }
+
         var state = GetOrCreateState(@event.Userid);
         var player = @event.Userid;
         if (state is null || player is null)
@@ -695,6 +733,121 @@ public sealed class BotRandomizerPlugin : BasePlugin
         }
     }
 
+    private int ResolvePlayerMusicKit()
+    {
+        var mode = PlayerMusicKit.Value;
+        var kitId = _playerMusic?.Resolve(mode) ?? 0;
+        if (_playerMusic is not null && mode != 0 && kitId == 0 && _warnedPlayerMusicModes.Add(mode))
+        {
+            Logger.LogWarning(
+                "[BotRandomizer] br_player_music_kit {KitId} is not a catalog kit ID; human music kit ignored", mode);
+        }
+        return kitId;
+    }
+
+    private bool TryGetPlayerMusicKit(CCSPlayerController? player, out int kitId)
+    {
+        kitId = 0;
+        if (player is not { IsValid: true, IsBot: false, IsHLTV: false })
+            return false;
+        kitId = ResolvePlayerMusicKit();
+        return kitId != 0;
+    }
+
+    private int ApplyPlayerMusicKit(CCSPlayerController? player)
+    {
+        if (!TryGetPlayerMusicKit(player, out var kitId)
+            || player!.InventoryServices is not { } inventory)
+        {
+            return 0;
+        }
+
+        // Preserve the first values, not a later reapplication of our own override.
+        if (!_originalPlayerMusic.TryGetValue(player.Slot, out var original)
+            || original.ControllerHandle != player.EntityHandle.Raw)
+        {
+            _originalPlayerMusic[player.Slot] = new PlayerMusicSnapshot(
+                player.EntityHandle.Raw, inventory.MusicID, player.MusicKitID,
+                player.MusicKitMVPs, player.MvpNoMusic);
+        }
+
+        ApplyMusicKit(player, kitId, 0);
+        return kitId;
+    }
+
+    private void RestorePlayerMusicKits()
+    {
+        foreach (var (slot, original) in _originalPlayerMusic)
+        {
+            var player = Utilities.GetPlayerFromSlot(slot);
+            if (player is { IsValid: true, IsBot: false, IsHLTV: false }
+                && player.EntityHandle.Raw == original.ControllerHandle)
+            {
+                ApplyMusicKit(player, original.MusicKitId, original.MusicKitMvps,
+                    original.MvpNoMusic, original.InventoryMusicId);
+            }
+        }
+        _originalPlayerMusic.Clear();
+    }
+
+    private void ApplyAllPlayerMusicKits()
+    {
+        if (ResolvePlayerMusicKit() == 0)
+        {
+            RestorePlayerMusicKits();
+            return;
+        }
+
+        foreach (var player in Utilities.GetPlayers())
+            ApplyPlayerMusicKit(player);
+    }
+
+    private void OnPlayerMusicKitChanged(object? sender, int value)
+        => ApplyAllPlayerMusicKits();
+
+    [ConsoleCommand("br_player_music_kits", "List catalog music kit IDs and English names")]
+    public void OnPlayerMusicKitsCommand(CCSPlayerController? player, CommandInfo command)
+    {
+        if (_catalog is null)
+        {
+            command.ReplyToCommand("Cosmetic catalog is unavailable.");
+            return;
+        }
+
+        foreach (var kitId in _catalog.MusicKits)
+        {
+            command.ReplyToCommand(_catalog.MusicKitNames.TryGetValue(kitId, out var name)
+                ? $"{kitId}: {name}"
+                : kitId.ToString());
+        }
+    }
+
+    [ConsoleCommand("br_player_music_reroll", "Reroll the shared human music kit in random mode")]
+    public void OnPlayerMusicRerollCommand(CCSPlayerController? player, CommandInfo command)
+    {
+        // Not SERVER_ONLY: that rejects a listen-server host's console, which is a player caller.
+        if (player is not null && HostConsole.Classify(player, _dedicatedServer) != HostConsole.Caller.Host)
+        {
+            command.ReplyToCommand(
+                "br_player_music_reroll: run this from the server console or the listen-server host's console.");
+            return;
+        }
+        if (PlayerMusicKit.Value != -1)
+        {
+            command.ReplyToCommand("Set br_player_music_kit to -1 to reroll human music.");
+            return;
+        }
+        if (_playerMusic is null)
+        {
+            command.ReplyToCommand("Cosmetic catalog is unavailable.");
+            return;
+        }
+
+        _playerMusic.Reroll();
+        ApplyAllPlayerMusicKits();
+        command.ReplyToCommand($"Human music kit: {ResolvePlayerMusicKit()}");
+    }
+
     [ConsoleCommand("br_reroll", "Queue new loadouts for the next safe spawn")]
     public void OnRerollCommand(CCSPlayerController? player, CommandInfo command)
     {
@@ -770,12 +923,17 @@ public sealed class BotRandomizerPlugin : BasePlugin
         return player is { IsValid: true, IsBot: true, IsHLTV: false } ? player : null;
     }
 
-    private static void ApplyMusicKit(CCSPlayerController player, int kitId, int musicKitMvps)
+    private static void ApplyMusicKit(
+        CCSPlayerController player,
+        int kitId,
+        int musicKitMvps,
+        bool mvpNoMusic = false,
+        ushort? inventoryMusicId = null)
     {
         var inventory = player.InventoryServices;
         if (inventory is not null)
         {
-            inventory.MusicID = checked((ushort)kitId);
+            inventory.MusicID = inventoryMusicId ?? checked((ushort)kitId);
             Utilities.SetStateChanged(player, "CCSPlayerController", "m_pInventoryServices");
         }
 
@@ -783,7 +941,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
         Utilities.SetStateChanged(player, "CCSPlayerController", "m_iMusicKitID");
         player.MusicKitMVPs = musicKitMvps;
         Utilities.SetStateChanged(player, "CCSPlayerController", "m_iMusicKitMVPs");
-        player.MvpNoMusic = false;
+        player.MvpNoMusic = mvpNoMusic;
         Utilities.SetStateChanged(player, "CCSPlayerController", "m_bMvpNoMusic");
     }
 

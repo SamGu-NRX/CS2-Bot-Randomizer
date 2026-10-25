@@ -21,6 +21,18 @@ CS2-Bot-Randomizer is a plugin based on CounterStrikeSharp that allows each bot 
 
 3. Restart your server
 
+## Human player music kits
+
+Human music overrides are off by default and never affect bots. In the server console, or the host's console on a listen server:
+
+- `br_player_music_kits` lists catalog kit IDs and English names. Older catalogs without names list kit IDs only.
+- `br_player_music_kit 33` selects a kit ID (33 is Blitz Kids, The Good Youth) for all human players.
+- `br_player_music_kit -1` shares one random kit across human players for the map.
+- `br_player_music_reroll` chooses a different random kit and applies it immediately when the mode is `-1`.
+- `br_player_music_kit 0` restores each human player's music fields captured before the override.
+
+Convar changes apply immediately through `FakeConVar.ValueChanged`. The plugin also reapplies on spawn, team join, round start and before the MVP event, including its anthem fields. An unknown kit ID is ignored and logged once per value for the plugin's lifetime; the listen-server host's console rejects it with a reply.
+
 # Credits
 [CS2-Lib](https://github.com/ianlucas/cs2-lib)  
 [CS2-CSS-Inventory-Simulator ](https://github.com/ianlucas/cs2-css-inventory-simulator)  
