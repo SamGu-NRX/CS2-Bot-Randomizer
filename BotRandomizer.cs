@@ -44,6 +44,8 @@ public sealed class BotRandomizerPlugin : BasePlugin
     private WeaponItemViewStore? _weaponItemViews;
     private bool _giveNamedItemHooked;
     private bool _giveNamedItemErrorLogged;
+    // From the server_spawn event; null until one fires after load.
+    private bool? _dedicatedServer;
 
     public override string ModuleName => "BotRandomizer";
     public override string ModuleVersion => "1.3.4";
@@ -66,6 +68,12 @@ public sealed class BotRandomizerPlugin : BasePlugin
         RegisterEventHandler<EventRoundMvp>(OnRoundMvp, HookMode.Pre);
         RegisterEventHandler<EventPlayerTeam>(OnPlayerTeam);
         RegisterEventHandler<EventItemPickup>(OnItemPickup);
+        RegisterEventHandler<EventServerSpawn>(OnServerSpawn);
+        // FakeConVar ignores player callers, including a listen-server host's console.
+        AddCommandListener(DroppedKnifeSkins.Name, (player, command) =>
+            HostConsole.HandleConVar(player, command, DroppedKnifeSkins, _dedicatedServer));
+        AddCommandListener(DroppedKnifePremium.Name, (player, command) =>
+            HostConsole.HandleConVar(player, command, DroppedKnifePremium, _dedicatedServer));
         if (_weaponItemViews?.NativeAvailable == true)
         {
             VirtualFunctions.GiveNamedItemFunc.Hook(OnGiveNamedItemPre, HookMode.Pre);
@@ -195,6 +203,12 @@ public sealed class BotRandomizerPlugin : BasePlugin
             return;
 
         _paintedDroppedKnives.Remove(entity.EntityHandle.Raw);
+    }
+
+    private HookResult OnServerSpawn(EventServerSpawn @event, GameEventInfo info)
+    {
+        _dedicatedServer = @event.Dedicated;
+        return HookResult.Continue;
     }
 
     private void OnMapStart(string mapName)
