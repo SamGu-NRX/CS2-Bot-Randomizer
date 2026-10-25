@@ -86,23 +86,7 @@ internal sealed class CosmeticApplicator
 
                 weapon.AcceptInput("ChangeSubclass", value: selection.DefIndex.ToString());
                 item.ItemDefinitionIndex = selection.DefIndex;
-                item.EntityQuality = 3;
-                if (_setAttributeByName is not null)
-                {
-                    item.AttributeList.Attributes.RemoveAll();
-                    item.NetworkedDynamicAttributes.Attributes.RemoveAll();
-                    AssignItemId(item);
-                    weapon.FallbackPaintKit = selection.PaintKit;
-                    weapon.FallbackSeed = 0;
-                    weapon.FallbackWear = selection.Wear;
-                    SetTextureAttributes(
-                        item.NetworkedDynamicAttributes,
-                        item.AttributeList,
-                        selection.PaintKit,
-                        0,
-                        selection.Wear);
-                }
-                Utilities.SetStateChanged(weapon, "CEconEntity", "m_AttributeManager");
+                ApplyKnifeFinish(weapon, item, selection.PaintKit, selection.Wear);
                 _appliedKnives[player.Slot] = new AppliedKnifeCosmetic(
                     pawn.EntityHandle.Raw,
                     weapon.EntityHandle.Raw,
@@ -115,6 +99,98 @@ internal sealed class CosmeticApplicator
         {
             _logger.LogError(exception, "[BotRandomizer] Failed to apply knife cosmetics");
         }
+    }
+
+    // Returns true when the knife was given a finish (or vanilla) and should be tracked.
+    internal bool ApplyDroppedKnifeFinish(CBasePlayerWeapon weapon, CosmeticRoller roller, ushort defIndex, bool premium)
+    {
+        if (!NativeAvailable || !weapon.IsValid || weapon.OwnerEntity.IsValid)
+            return false;
+        // Inventory finishes can be resolved through an item ID rather than local
+        // paint attributes. Leave previously owned inventory knives alone too.
+        if (weapon.OriginalOwnerXuidLow != 0 || weapon.OriginalOwnerXuidHigh != 0)
+            return false;
+
+        try
+        {
+            var item = weapon.AttributeManager?.Item;
+            if (item is null
+                || weapon.FallbackPaintKit > 0
+                || HasPaintAttribute(item.AttributeList)
+                || HasPaintAttribute(item.NetworkedDynamicAttributes)
+                || !roller.TryRollKnifeFinish(defIndex, allowVanilla: true, premium, out var paintKit, out var wear))
+            {
+                return false;
+            }
+
+            // subclass_create leaves the default knife's definition on the item. Follow the
+            // bot path: ChangeSubclass rebuilds the weapon's model data so the finish is drawn.
+            weapon.AcceptInput("ChangeSubclass", value: defIndex.ToString());
+            item.ItemDefinitionIndex = defIndex;
+            // A subclass_create knife's item view starts uninitialized (quality 0, item ID 0), and the
+            // client ignores finish attributes on it; knives from GiveNamedItem start initialized.
+            item.Initialized = true;
+            if (paintKit == 0)
+            {
+                // Vanilla: a star-quality knife with no finish.
+                item.EntityQuality = 3;
+                Utilities.SetStateChanged(weapon, "CEconEntity", "m_AttributeManager");
+            }
+            else
+            {
+                ApplyKnifeFinish(weapon, item, paintKit, wear);
+            }
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _logger.LogError(exception, "[BotRandomizer] Failed to apply a dropped knife finish");
+            return false;
+        }
+    }
+
+    // An initialized item with no owner is replaced at the next round start, so the human who
+    // picks a painted dropped knife up becomes its owner, as with an inventory knife.
+    internal void ClaimDroppedKnife(CBasePlayerWeapon weapon, ulong steamId)
+    {
+        var item = weapon.AttributeManager?.Item;
+        if (item is null)
+            return;
+        item.AccountID = AccountIdFromSteamId(steamId);
+        weapon.OriginalOwnerXuidLow = (uint)steamId;
+        weapon.OriginalOwnerXuidHigh = (uint)(steamId >> 32);
+        Utilities.SetStateChanged(weapon, "CEconEntity", "m_AttributeManager");
+        Utilities.SetStateChanged(weapon, "CEconEntity", "m_OriginalOwnerXuidLow");
+        Utilities.SetStateChanged(weapon, "CEconEntity", "m_OriginalOwnerXuidHigh");
+    }
+
+    private static bool HasPaintAttribute(CAttributeList list)
+    {
+        var attributes = list.Attributes;
+        for (var i = 0; i < attributes.Count; i++)
+        {
+            var attribute = attributes[i];
+            // Economy attribute 6 is "set item texture prefab".
+            if (attribute.AttributeDefinitionIndex == 6 && attribute.Value > 0)
+                return true;
+        }
+        return false;
+    }
+
+    private void ApplyKnifeFinish(CBasePlayerWeapon weapon, CEconItemView item, int paintKit, float wear)
+    {
+        item.EntityQuality = 3;
+        if (_setAttributeByName is not null)
+        {
+            item.AttributeList.Attributes.RemoveAll();
+            item.NetworkedDynamicAttributes.Attributes.RemoveAll();
+            AssignItemId(item);
+            weapon.FallbackPaintKit = paintKit;
+            weapon.FallbackSeed = 0;
+            weapon.FallbackWear = wear;
+            SetTextureAttributes(item.NetworkedDynamicAttributes, item.AttributeList, paintKit, 0, wear);
+        }
+        Utilities.SetStateChanged(weapon, "CEconEntity", "m_AttributeManager");
     }
 
     internal bool ApplyGloves(
