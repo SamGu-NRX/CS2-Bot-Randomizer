@@ -18,6 +18,9 @@ internal sealed class PlayerMusicKitSelection(IReadOnlyList<int> kits)
         return mode > 0 && mode <= ushort.MaxValue && _knownKits.Contains(mode) ? mode : 0;
     }
 
+    // Values Resolve can act on: off, random, or a kit ID in the catalog.
+    internal bool IsKnownMode(int mode) => mode is 0 or -1 || _knownKits.Contains(mode);
+
     internal void ResetMap() => _randomKit = 0;
 
     internal void Reroll()
