@@ -36,7 +36,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
         uint ControllerHandle, ushort InventoryMusicId, int MusicKitId, int MusicKitMvps, bool MvpNoMusic);
 
     public FakeConVar<int> PlayerMusicKit = new(
-        "br_player_music_kit", "Human music kit: 0 = off, -1 = random per map, positive = catalog index", 0);
+        "br_player_music_kit", "Human music kit: 0 = off, -1 = random per map, positive = kit ID", 0);
 
     private CosmeticCatalog? _catalog;
     private CosmeticRoller? _roller;
@@ -74,6 +74,11 @@ public sealed class BotRandomizerPlugin : BasePlugin
             HostConsole.HandleConVar(player, command, DroppedKnifeSkins, _dedicatedServer));
         AddCommandListener(DroppedKnifePremium.Name, (player, command) =>
             HostConsole.HandleConVar(player, command, DroppedKnifePremium, _dedicatedServer));
+        AddCommandListener(PlayerMusicKit.Name, (player, command) =>
+            HostConsole.HandleConVar(player, command, PlayerMusicKit, _dedicatedServer,
+                mode => _playerMusic?.IsKnownMode(mode) == false
+                    ? $"unknown kit ID {mode}; br_player_music_kits lists them."
+                    : null));
         if (_weaponItemViews?.NativeAvailable == true)
         {
             VirtualFunctions.GiveNamedItemFunc.Hook(OnGiveNamedItemPre, HookMode.Pre);
@@ -709,7 +714,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
         if (_playerMusic is not null && mode != 0 && kitId == 0 && _warnedPlayerMusicModes.Add(mode))
         {
             Logger.LogWarning(
-                "[BotRandomizer] Unknown br_player_music_kit index {Index}; human music kit ignored", mode);
+                "[BotRandomizer] br_player_music_kit {KitId} is not a catalog kit ID; human music kit ignored", mode);
         }
         return kitId;
     }
@@ -774,7 +779,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
     private void OnPlayerMusicKitChanged(object? sender, int value)
         => ApplyAllPlayerMusicKits();
 
-    [ConsoleCommand("br_player_music_kits", "List catalog music kit indexes and English names")]
+    [ConsoleCommand("br_player_music_kits", "List catalog music kit IDs and English names")]
     public void OnPlayerMusicKitsCommand(CCSPlayerController? player, CommandInfo command)
     {
         if (_catalog is null)
@@ -792,9 +797,15 @@ public sealed class BotRandomizerPlugin : BasePlugin
     }
 
     [ConsoleCommand("br_player_music_reroll", "Reroll the shared human music kit in random mode")]
-    [CommandHelper(whoCanExecute: CommandUsage.SERVER_ONLY)]
     public void OnPlayerMusicRerollCommand(CCSPlayerController? player, CommandInfo command)
     {
+        // Not SERVER_ONLY: that rejects a listen-server host's console, which is a player caller.
+        if (player is not null && HostConsole.Classify(player, _dedicatedServer) != HostConsole.Caller.Host)
+        {
+            command.ReplyToCommand(
+                "br_player_music_reroll: run this from the server console or the listen-server host's console.");
+            return;
+        }
         if (PlayerMusicKit.Value != -1)
         {
             command.ReplyToCommand("Set br_player_music_kit to -1 to reroll human music.");
